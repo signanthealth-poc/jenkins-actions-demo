@@ -176,13 +176,63 @@ jobs:
             echo "ℹ️ SonarCloud scan completed (errors ignored for demo)"
           fi
 
+      - name: Detect source code languages
+        id: detect-languages
+        run: |
+          LANGUAGES=""
+          
+          # Check for Java source files
+          if find . -name "*.java" -not -path "./target/*" -not -path "./build/*" | head -1 | grep -q .; then
+            LANGUAGES="java"
+            echo "Java source code detected"
+          fi
+          
+          # Check for JavaScript/TypeScript files
+          if find . -name "*.js" -o -name "*.ts" -o -name "*.jsx" -o -name "*.tsx" | grep -v node_modules | head -1 | grep -q .; then
+            if [ "$LANGUAGES" != "" ]; then
+              LANGUAGES="$LANGUAGES,javascript"
+            else
+              LANGUAGES="javascript"
+            fi
+            echo "JavaScript/TypeScript source code detected"
+          fi
+          
+          # Check for Python source files
+          if find . -name "*.py" -not -path "./venv/*" -not -path "./__pycache__/*" | head -1 | grep -q .; then
+            if [ "$LANGUAGES" != "" ]; then
+              LANGUAGES="$LANGUAGES,python"
+            else
+              LANGUAGES="python"
+            fi
+            echo "Python source code detected"
+          fi
+          
+          echo "languages=$LANGUAGES" >> $GITHUB_OUTPUT
+          
+          if [ "$LANGUAGES" = "" ]; then
+            echo "No source code files detected for CodeQL analysis"
+          else
+            echo "CodeQL will analyze: $LANGUAGES"
+          fi
+
       - name: Security scan with CodeQL
+        if: steps.detect-languages.outputs.languages != ''
         uses: github/codeql-action/init@v3
         with:
-          languages: 'java,javascript,python'
+          languages: ${{ steps.detect-languages.outputs.languages }}
 
       - name: Perform CodeQL Analysis
+        if: steps.detect-languages.outputs.languages != ''
         uses: github/codeql-action/analyze@v3
+
+      - name: CodeQL Status
+        run: |
+          if [ "${{ steps.detect-languages.outputs.languages }}" = "" ]; then
+            echo "⚠️ CodeQL analysis skipped - no source code files detected"
+            echo "ℹ️ This is normal for demo repositories without actual source code"
+          else
+            echo "✅ CodeQL security analysis completed for: ${{ steps.detect-languages.outputs.languages }}"
+          fi
 
       # Build Stage - Build all applications (conditional)
       - name: Build Java application
