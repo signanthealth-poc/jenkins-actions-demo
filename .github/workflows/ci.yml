@@ -72,11 +72,17 @@ jobs:
         uses: actions/cache@v3
         with:
           path: |
-            ~/.npm
             ~/.gradle/caches
             ~/.gradle/wrapper
             ~/.cache/pip
-          key: ${{ runner.os }}-deps-${{ hashFiles('**/package-lock.json', '**/gradle-wrapper.properties', '**/requirements.txt') }}
+          key: ${{ runner.os }}-deps-${{ hashFiles('**/gradle-wrapper.properties', '**/requirements.txt') }}
+
+      - name: Cache npm dependencies
+        if: hashFiles('**/package-lock.json') != ''
+        uses: actions/cache@v3
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
 
       # Install dependencies for all languages (conditional)
       - name: Install Node.js dependencies
