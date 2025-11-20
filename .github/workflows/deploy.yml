@@ -158,14 +158,14 @@ jobs:
         artifact: ${{ fromJson(needs.prepare-deployment.outputs.artifact-names) }}
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: ${{ matrix.artifact }}
           path: ./artifacts/${{ matrix.artifact }}
           run-id: ${{ inputs.build_number }}
 
       - name: Download build metadata
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: build-metadata-${{ matrix.artifact }}
           path: ./metadata
@@ -212,7 +212,7 @@ jobs:
           ref: ${{ inputs.commit_sha }}
 
       - name: Download deployment package
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: deployment-package-${{ matrix.artifact }}
           path: ./deployment
