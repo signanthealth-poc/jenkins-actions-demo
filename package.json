@@ -1,0 +1,33 @@
+{
+  "name": "signant-health-demo-nodejs",
+  "version": "1.0.0",
+  "description": "Signant Health Demo - Node.js Service",
+  "main": "src/nodejs/app.js",
+  "scripts": {
+    "start": "node src/nodejs/app.js",
+    "test": "jest",
+    "test:coverage": "jest --coverage",
+    "lint": "eslint src/nodejs/",
+    "lint:fix": "eslint src/nodejs/ --fix",
+    "lint:security": "npm audit"
+  },
+  "keywords": ["signant", "health", "demo", "nodejs"],
+  "author": "Signant Health",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^6.3.3",
+    "eslint": "^8.55.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "collectCoverageFrom": [
+      "src/nodejs/**/*.js"
+    ],
+    "coverageDirectory": "coverage",
+    "coverageReporters": ["text", "lcov", "html"]
+  }
+}

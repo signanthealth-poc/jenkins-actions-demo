@@ -1,0 +1,440 @@
+name: Deploy Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      build_number:
+        description: 'Build number to deploy'
+        required: true
+        type: string
+      commit_sha:
+        description: 'Commit SHA to deploy'
+        required: true
+        type: string
+      create_feature_release:
+        description: 'Create feature release'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  DEPLOYMENT_TIMEOUT: 600  # 10 minutes
+  HEALTH_CHECK_TIMEOUT: 300  # 5 minutes
+
+jobs:
+  # Equivalent to Jenkins Deploy stage preparation
+  prepare-deployment:
+    name: Prepare Deployment
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    outputs:
+      deployment-strategy: ${{ steps.strategy.outputs.strategy }}
+      artifact-names: ${{ steps.artifacts.outputs.names }}
+      infrastructure-required: ${{ steps.infra-check.outputs.required }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+
+      - name: Determine deployment strategy
+        id: strategy
+        run: |
+          STRATEGY="rolling"
+          
+          case "${{ inputs.environment }}" in
+            "prod")
+              STRATEGY="blue-green"
+              ;;
+            "staging")
+              STRATEGY="canary"
+              ;;
+            "dev")
+              STRATEGY="recreate"
+              ;;
+          esac
+          
+          echo "strategy=$STRATEGY" >> $GITHUB_OUTPUT
+          echo "Deployment strategy for ${{ inputs.environment }}: $STRATEGY"
+
+      - name: Identify artifacts to deploy
+        id: artifacts
+        run: |
+          # Create array of artifact names based on what was built
+          ARTIFACTS='[]'
+          
+          if [ -f "package.json" ]; then
+            ARTIFACTS=$(echo $ARTIFACTS | jq '. += ["build-artifacts-nodejs"]')
+          fi
+          
+          if [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            ARTIFACTS=$(echo $ARTIFACTS | jq '. += ["build-artifacts-java"]')
+          fi
+          
+          if [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then
+            ARTIFACTS=$(echo $ARTIFACTS | jq '. += ["build-artifacts-python"]')
+          fi
+          
+          echo "names=$ARTIFACTS" >> $GITHUB_OUTPUT
+
+      - name: Check infrastructure requirements
+        id: infra-check
+        run: |
+          INFRA_REQUIRED="false"
+          
+          # Check if infrastructure files exist
+          if [ -f "infrastructure/terraform/main.tf" ] || [ -f "infra/main.tf" ] || [ -f "azure-pipelines.yml" ]; then
+            INFRA_REQUIRED="true"
+          fi
+          
+          echo "required=$INFRA_REQUIRED" >> $GITHUB_OUTPUT
+
+  # Infrastructure provisioning (if required)
+  provision-infrastructure:
+    name: Provision Infrastructure
+    runs-on: ubuntu-latest
+    needs: prepare-deployment
+    if: needs.prepare-deployment.outputs.infrastructure-required == 'true'
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.7
+
+      - name: Configure Azure credentials
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Terraform Init
+        run: |
+          cd infrastructure/terraform || cd infra
+          terraform init -backend-config="resource_group_name=${{ vars.TERRAFORM_RESOURCE_GROUP }}"
+
+      - name: Terraform Plan
+        run: |
+          cd infrastructure/terraform || cd infra
+          terraform plan -var="environment=${{ inputs.environment }}" -out=tfplan
+
+      - name: Terraform Apply
+        if: inputs.environment != 'prod' || github.actor == 'admin'
+        run: |
+          cd infrastructure/terraform || cd infra
+          terraform apply -auto-approve tfplan
+
+      - name: Export infrastructure outputs
+        run: |
+          cd infrastructure/terraform || cd infra
+          terraform output -json > ../infrastructure-outputs.json
+
+      - name: Upload infrastructure outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: infrastructure-outputs-${{ inputs.environment }}
+          path: infrastructure-outputs.json
+
+  # Download and prepare artifacts
+  download-artifacts:
+    name: Download Build Artifacts
+    runs-on: ubuntu-latest
+    needs: prepare-deployment
+    strategy:
+      matrix:
+        artifact: ${{ fromJson(needs.prepare-deployment.outputs.artifact-names) }}
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ./artifacts/${{ matrix.artifact }}
+          run-id: ${{ inputs.build_number }}
+
+      - name: Download build metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: build-metadata-${{ matrix.artifact }}
+          path: ./metadata
+          run-id: ${{ inputs.build_number }}
+
+      - name: Prepare deployment package
+        run: |
+          mkdir -p deployment-package
+          cp -r artifacts/${{ matrix.artifact }}/* deployment-package/
+          cp metadata/* deployment-package/
+          
+          # Create deployment manifest
+          cat > deployment-package/deployment-manifest.json << EOF
+          {
+            "artifact_name": "${{ matrix.artifact }}",
+            "build_number": "${{ inputs.build_number }}",
+            "commit_sha": "${{ inputs.commit_sha }}",
+            "environment": "${{ inputs.environment }}",
+            "deployment_time": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "deployment_strategy": "${{ needs.prepare-deployment.outputs.deployment-strategy }}"
+          }
+          EOF
+
+      - name: Upload deployment package
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-package-${{ matrix.artifact }}
+          path: deployment-package/
+
+  # Deploy to target environment
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    needs: [prepare-deployment, download-artifacts]
+    if: always() && (needs.provision-infrastructure.result == 'success' || needs.provision-infrastructure.result == 'skipped')
+    environment: ${{ inputs.environment }}
+    strategy:
+      matrix:
+        artifact: ${{ fromJson(needs.prepare-deployment.outputs.artifact-names) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+
+      - name: Download deployment package
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-package-${{ matrix.artifact }}
+          path: ./deployment
+
+      - name: Configure Azure credentials
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy Java application
+        if: contains(matrix.artifact, 'java')
+        run: |
+          # Deploy Java Spring Boot application
+          APP_NAME="${{ vars.APP_NAME_PREFIX }}-java-${{ inputs.environment }}"
+          
+          az webapp deployment source config-zip \
+            --resource-group ${{ vars.RESOURCE_GROUP_NAME }} \
+            --name $APP_NAME \
+            --src deployment/*.jar
+
+      - name: Deploy Node.js application
+        if: contains(matrix.artifact, 'nodejs')
+        run: |
+          # Deploy Node.js application
+          APP_NAME="${{ vars.APP_NAME_PREFIX }}-nodejs-${{ inputs.environment }}"
+          
+          # Extract and deploy
+          cd deployment
+          tar -xzf *.tgz
+          
+          az webapp deployment source config-zip \
+            --resource-group ${{ vars.RESOURCE_GROUP_NAME }} \
+            --name $APP_NAME \
+            --src package.tgz
+
+      - name: Deploy Python application
+        if: contains(matrix.artifact, 'python')
+        run: |
+          # Deploy Python application
+          APP_NAME="${{ vars.APP_NAME_PREFIX }}-python-${{ inputs.environment }}"
+          
+          az webapp deployment source config-zip \
+            --resource-group ${{ vars.RESOURCE_GROUP_NAME }} \
+            --name $APP_NAME \
+            --src deployment/*.whl
+
+      - name: Update application configuration
+        run: |
+          APP_NAME="${{ vars.APP_NAME_PREFIX }}-${{ matrix.artifact }}-${{ inputs.environment }}"
+          
+          # Set environment-specific configuration
+          az webapp config appsettings set \
+            --resource-group ${{ vars.RESOURCE_GROUP_NAME }} \
+            --name $APP_NAME \
+            --settings \
+              "ENVIRONMENT=${{ inputs.environment }}" \
+              "BUILD_NUMBER=${{ inputs.build_number }}" \
+              "COMMIT_SHA=${{ inputs.commit_sha }}" \
+              "DEPLOYMENT_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+      - name: Restart application
+        run: |
+          APP_NAME="${{ vars.APP_NAME_PREFIX }}-${{ matrix.artifact }}-${{ inputs.environment }}"
+          az webapp restart \
+            --resource-group ${{ vars.RESOURCE_GROUP_NAME }} \
+            --name $APP_NAME
+
+  # Health checks and validation
+  post-deployment-validation:
+    name: Post-Deployment Validation
+    runs-on: ubuntu-latest
+    needs: [prepare-deployment, deploy]
+    environment: ${{ inputs.environment }}
+    strategy:
+      matrix:
+        artifact: ${{ fromJson(needs.prepare-deployment.outputs.artifact-names) }}
+    steps:
+      - name: Wait for application startup
+        run: |
+          echo "Waiting for application to start..."
+          sleep 30
+
+      - name: Health check
+        run: |
+          APP_NAME="${{ vars.APP_NAME_PREFIX }}-${{ matrix.artifact }}-${{ inputs.environment }}"
+          HEALTH_URL="https://$APP_NAME.azurewebsites.net/health"
+          
+          # Health check with retry
+          for i in {1..10}; do
+            if curl -f -s $HEALTH_URL > /dev/null; then
+              echo "✅ Health check passed for ${{ matrix.artifact }}"
+              break
+            else
+              echo "⏳ Health check attempt $i/10 failed, retrying in 30s..."
+              sleep 30
+            fi
+            
+            if [ $i -eq 10 ]; then
+              echo "❌ Health check failed after 10 attempts"
+              exit 1
+            fi
+          done
+
+      - name: Smoke tests
+        run: |
+          APP_NAME="${{ vars.APP_NAME_PREFIX }}-${{ matrix.artifact }}-${{ inputs.environment }}"
+          BASE_URL="https://$APP_NAME.azurewebsites.net"
+          
+          # Basic smoke tests
+          curl -f "$BASE_URL/health" || exit 1
+          curl -f "$BASE_URL/info" || echo "Info endpoint not available"
+          
+          echo "✅ Smoke tests passed for ${{ matrix.artifact }}"
+
+      - name: Performance baseline
+        if: inputs.environment == 'prod'
+        run: |
+          APP_NAME="${{ vars.APP_NAME_PREFIX }}-${{ matrix.artifact }}-${{ inputs.environment }}"
+          BASE_URL="https://$APP_NAME.azurewebsites.net"
+          
+          # Simple performance test
+          echo "Running performance baseline..."
+          for i in {1..5}; do
+            curl -w "Response time: %{time_total}s\n" -o /dev/null -s "$BASE_URL/health"
+          done
+
+  # Create feature release if requested
+  create-feature-release:
+    name: Create Feature Release
+    runs-on: ubuntu-latest
+    needs: [prepare-deployment, post-deployment-validation]
+    if: inputs.create_feature_release == true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+
+      - name: Generate release notes
+        run: |
+          # Generate release notes based on commits
+          RELEASE_VERSION="v$(date +%Y.%m.%d)-build.${{ inputs.build_number }}"
+          
+          cat > release-notes.md << EOF
+          # Release $RELEASE_VERSION
+          
+          **Environment:** ${{ inputs.environment }}
+          **Build:** #${{ inputs.build_number }}
+          **Commit:** ${{ inputs.commit_sha }}
+          **Deployed:** $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          
+          ## Changes
+          $(git log --oneline --since="24 hours ago" || echo "- Incremental build and deployment")
+          
+          ## Deployment Strategy
+          - Strategy: ${{ needs.prepare-deployment.outputs.deployment-strategy }}
+          - Environment: ${{ inputs.environment }}
+          - Artifacts: ${{ needs.prepare-deployment.outputs.artifact-names }}
+          EOF
+
+      - name: Create GitHub release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: "build-${{ inputs.build_number }}-${{ inputs.environment }}"
+          release_name: "Build ${{ inputs.build_number }} - ${{ inputs.environment }}"
+          body_path: release-notes.md
+          draft: false
+          prerelease: ${{ inputs.environment != 'prod' }}
+
+  # Notification and reporting
+  deployment-summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [prepare-deployment, deploy, post-deployment-validation]
+    if: always()
+    steps:
+      - name: Generate deployment summary
+        run: |
+          cat > deployment-summary.md << EOF
+          # Deployment Summary
+          
+          **Environment:** ${{ inputs.environment }}
+          **Build Number:** ${{ inputs.build_number }}
+          **Commit SHA:** ${{ inputs.commit_sha }}
+          **Strategy:** ${{ needs.prepare-deployment.outputs.deployment-strategy }}
+          **Status:** ${{ job.status }}
+          
+          ## Deployed Artifacts
+          ${{ needs.prepare-deployment.outputs.artifact-names }}
+          
+          ## Validation Results
+          - Deploy Job: ${{ needs.deploy.result }}
+          - Validation Job: ${{ needs.post-deployment-validation.result }}
+          
+          ## Environment Details
+          - Resource Group: ${{ vars.RESOURCE_GROUP_NAME }}
+          - App Name Prefix: ${{ vars.APP_NAME_PREFIX }}
+          
+          **Deployment completed at:** $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+
+      - name: Post to Slack (if configured)
+        if: vars.SLACK_WEBHOOK_URL != ''
+        run: |
+          STATUS_EMOJI="✅"
+          if [ "${{ job.status }}" != "success" ]; then
+            STATUS_EMOJI="❌"
+          fi
+          
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{
+              \"text\": \"$STATUS_EMOJI Deployment to ${{ inputs.environment }} completed\",
+              \"blocks\": [
+                {
+                  \"type\": \"section\",
+                  \"text\": {
+                    \"type\": \"mrkdwn\",
+                    \"text\": \"*Signant Health Demo Deployment*\n Environment: ${{ inputs.environment }}\n Build: #${{ inputs.build_number }}\n Status: ${{ job.status }}\"
+                  }
+                }
+              ]
+            }" \
+            ${{ vars.SLACK_WEBHOOK_URL }}
